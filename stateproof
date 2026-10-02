@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""stateproof —— 本地文件的存储证明与可检索性抽样挑战工具。
+
+子命令：
+  proof generate   递归收集普通文件，分块并生成 BLAKE2b-256 Merkle 证明
+  proof challenge  按 proof_id 与 seed 确定性抽样，重读分块复核并更新状态
+  proof status     按 proof_id 汇总挑战状态
+
+只读本地普通文件：符号链接、目录、设备文件等非普通文件一律不参与。
+"""
+
+import argparse
+import bisect
+import hashlib
+import heapq
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+from collections import defaultdict
+from datetime import datetime, timezone
+
+CHUNK_SIZE = 64 * 1024
+VERSION = 1
+HASH_ALGORITHM = "BLAKE2b-256"
+HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+# ---------------------------------------------------------------------------
+# 错误类型（对应规格中的五类 error.type，失败一律退出码 2）
+# ---------------------------------------------------------------------------
+
+class CliError(Exception):
+    type_name = "InputError"
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
+
+
+class InputError(CliError):
+    type_name = "InputError"
+
+
+class RootUnavailable(CliError):
+    type_name = "RootUnavailable"
+
+
+class ProofFormatError(CliError):
+    type_name = "ProofFormatError"
+
+
+class ChallengeRangeError(CliError):
+    type_name = "ChallengeRangeError"
+
+
+class StateConflict(CliError):
+    type_name = "StateConflict"
+
+
+# ---------------------------------------------------------------------------
+# 摘要原语：分块摘要 / 文件摘要 / 根摘要，均为 BLAKE2b-256（输出 32 字节）
+# ---------------------------------------------------------------------------
+
+def digest(data=b""):
+    return hashlib.blake2b(data, digest_size=32).digest()
+
+
+def file_digest(rel_b, chunk_digests):
+    h = hashlib.blake2b(digest_size=32)
+    h.update(b"file\x00")
+    h.update(rel_b)
+    h.update(b"\x00")
+    for cd in chunk_digests:
+        h.update(cd)  # 定长 32 字节，无需额外分隔
+    return h.digest()
+
+
+def root_digest(file_digests):
+    h = hashlib.blake2b(digest_size=32)
+    h.update(b"root\x00")
+    for fd in file_digests:
+        h.update(fd)  # 定长 32 字节，无需额外分隔
+    return h.digest()
+
+
+# ---------------------------------------------------------------------------
+# 文件遍历与分块（bytes 路径，避免文件名编码问题；不跟随符号链接）
+# ---------------------------------------------------------------------------
+
+def open_regular(path_b):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    return os.fdopen(os.open(path_b, flags), "rb")
+
+
+def read_chunks(path_b):
+    """按 64 KiB 顺序分块；空文件产生一个零长度块。"""
+    chunks = []
+    with open_regular(path_b) as f:
+        while True:
+            b = f.read(CHUNK_SIZE)
+            if not b:
+                break
+            chunks.append(b)
+    if not chunks:
+        chunks = [b""]
+    return chunks
+
+
+def collect_files(root_b):
+    """递归收集普通文件，返回按 POSIX 相对路径字节序排序的记录列表。
+
+    每条：(rel_bytes, size, mtime_ns, [chunk_bytes, ...])
+    """
+    found = []
+
+    def descend(dir_b, parts):
+        try:
+            with os.scandir(dir_b) as entries:
+                entries = list(entries)
+        except OSError as e:
+            raise RootUnavailable("root 不可遍历：%s（%s）" % (os.fsdecode(dir_b), e))
+
+        entries.sort(key=lambda e: e.name)  # POSIX 文件名字节序
+        for entry in entries:
+            name = entry.name
+            try:
+                if entry.is_symlink():
+                    continue  # 符号链接一律不参与
+                st = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue  # 遍历期间消失，视为不存在
+            except OSError as e:
+                raise RootUnavailable("无法读取文件元数据：%s（%s）"
+                                      % (os.fsdecode(entry.path), e))
+
+            mode = st.st_mode
+            if stat.S_ISDIR(mode):
+                descend(entry.path, parts + [name])
+            elif stat.S_ISREG(mode):
+                rel_b = b"/".join(parts + [name])
+                try:
+                    chunks = read_chunks(entry.path)
+                except OSError as e:
+                    raise RootUnavailable("无法读取普通文件：%s（%s）"
+                                          % (os.fsdecode(rel_b), e))
+                found.append((rel_b, st.st_size, st.st_mtime_ns, chunks))
+            # 其他类型（设备、FIFO、socket 等）跳过
+
+    descend(root_b, [])
+    found.sort(key=lambda r: r[0])
+    return found
+
+
+# ---------------------------------------------------------------------------
+# 原子写入：临时文件 + fsync + 同目录 replace，失败不留半成品
+# ---------------------------------------------------------------------------
+
+def atomic_write(path, data_b):
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        raise OSError("父目录不存在或不是目录：%s" % parent)
+    if os.path.exists(path) and not os.path.isfile(path):
+        raise OSError("目标路径已存在且不是普通文件：%s" % path)
+
+    fd, tmp = tempfile.mkstemp(prefix=".%s.tmp-" % os.path.basename(path),
+                               dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data_b)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        try:
+            dfd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass  # 目录 fsync 是尽力而为
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def emit_json(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=True, indent=2) + "\n")
+
+
+def emit_error(err):
+    sys.stderr.write(
+        json.dumps({"error": {"type": err.type_name, "message": err.message}},
+                   ensure_ascii=True) + "\n")
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+# ---------------------------------------------------------------------------
+# proof generate
+# ---------------------------------------------------------------------------
+
+def cmd_generate(args):
+    root_b = os.fsencode(os.path.abspath(args.root))
+    records = collect_files(root_b)  # RootUnavailable 由上层处理
+
+    files_json = []
+    file_digests = []
+    total_chunks = 0
+
+    for rel_b, size, mtime_ns, chunks in records:
+        chunk_digests = [digest(c) for c in chunks]
+        fd = file_digest(rel_b, chunk_digests)
+        file_digests.append(fd)
+        total_chunks += len(chunks)
+        files_json.append({
+            "path": os.fsdecode(rel_b),
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "digest": fd.hex(),
+            "chunks": [
+                {"index": i, "size": len(c), "digest": cd.hex()}
+                for i, (c, cd) in enumerate(zip(chunks, chunk_digests))
+            ],
+        })
+
+    root = root_digest(file_digests)
+    proof = {
+        "version": VERSION,
+        "proof_id": root.hex(),
+        "root_digest": root.hex(),
+        "hash_algorithm": HASH_ALGORITHM,
+        "chunk_size": CHUNK_SIZE,
+        "generated_at": now_iso(),
+        "root": args.root,
+        "file_count": len(files_json),
+        "total_chunks": total_chunks,
+        "files": files_json,
+    }
+
+    try:
+        atomic_write(args.proof,
+                     (json.dumps(proof, ensure_ascii=True, indent=2) + "\n")
+                     .encode("ascii"))
+    except OSError as e:
+        raise InputError("证明文件无法写入：%s" % e)
+
+    emit_json({
+        "proof_id": proof["proof_id"],
+        "root_digest": proof["root_digest"],
+        "file_count": proof["file_count"],
+        "total_chunks": total_chunks,
+        "proof_path": os.path.abspath(args.proof),
+    })
+
+
+# ---------------------------------------------------------------------------
+# 证明文件的加载与严格校验
+# ---------------------------------------------------------------------------
+
+def is_hex64(s):
+    return isinstance(s, str) and HEX64.fullmatch(s) is not None
+
+
+def safe_rel_path(path_str):
+    """证明内的相对路径必须安全：禁止绝对路径、.. 穿越、空组件与 NUL。"""
+    if not isinstance(path_str, str) or path_str == "":
+        raise ProofFormatError("文件路径必须是非空字符串")
+    rel_b = os.fsencode(path_str)
+    parts = rel_b.split(b"/")
+    for comp in parts:
+        if comp in (b"", b".", b"..") or b"\x00" in comp:
+            raise ProofFormatError("证明含非法路径组件：%r" % path_str)
+    return rel_b
+
+
+def _as_nonneg_int(v, name):
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        raise ProofFormatError("%s 必须是非负整数" % name)
+    return v
+
+
+def load_proof(proof_path):
+    try:
+        with open(proof_path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        raise ProofFormatError("证明文件不可读取：%s" % e)
+
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ProofFormatError("证明不是合法 JSON：%s" % e)
+
+    if not isinstance(obj, dict):
+        raise ProofFormatError("证明顶层必须是对象")
+    if obj.get("version") != VERSION:
+        raise ProofFormatError("不支持的证明版本：%r" % obj.get("version"))
+    if obj.get("hash_algorithm", HASH_ALGORITHM) != HASH_ALGORITHM:
+        raise ProofFormatError("不支持的哈希算法：%r" % obj.get("hash_algorithm"))
+    if obj.get("chunk_size") != CHUNK_SIZE:
+        raise ProofFormatError("分块大小必须是 %d" % CHUNK_SIZE)
+    pid, rd = obj.get("proof_id"), obj.get("root_digest")
+    if not is_hex64(pid) or not is_hex64(rd) or pid != rd:
+        raise ProofFormatError("proof_id 与根摘要必须是一致的小写十六进制摘要")
+
+    files = obj.get("files")
+    if not isinstance(files, list):
+        raise ProofFormatError("files 必须是数组")
+
+    checked_size = obj.get("total_chunks")
+    total_chunks = 0
+    prev_rel = None
+    file_digests = []
+    parsed = []
+
+    for pos, f in enumerate(files):
+        if not isinstance(f, dict):
+            raise ProofFormatError("files[%d] 必须是对象" % pos)
+        rel_b = safe_rel_path(f.get("path"))
+        if prev_rel is not None and rel_b <= prev_rel:
+            raise ProofFormatError("文件路径必须唯一且按字节序升序：%r"
+                                   % os.fsdecode(rel_b))
+        prev_rel = rel_b
+
+        size = _as_nonneg_int(f.get("size"), "files[%d].size" % pos)
+        if not is_hex64(f.get("digest")):
+            raise ProofFormatError("files[%d].digest 必须是 64 位小写十六进制" % pos)
+
+        chunks = f.get("chunks")
+        if not isinstance(chunks, list) or not chunks:
+            raise ProofFormatError("files[%d].chunks 必须是非空数组" % pos)
+
+        expected = max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE)
+        if len(chunks) != expected:
+            raise ProofFormatError("files[%d] 分块数与大小不一致" % pos)
+
+        chunk_digests = []
+        last_tail = size - (expected - 1) * CHUNK_SIZE  # 最后一块的应有字节数
+        for j, c in enumerate(chunks):
+            if not isinstance(c, dict) or c.get("index") != j:
+                raise ProofFormatError("files[%d] 分块 %d 索引错误" % (pos, j))
+            csize = _as_nonneg_int(c.get("size"), "chunk.size")
+            if j < expected - 1:
+                if csize != CHUNK_SIZE:
+                    raise ProofFormatError("files[%d] 非末块大小必须为 %d"
+                                           % (pos, CHUNK_SIZE))
+            elif csize != last_tail:
+                raise ProofFormatError("files[%d] 末块大小与文件大小不一致" % pos)
+            if not is_hex64(c.get("digest")):
+                raise ProofFormatError("files[%d] 分块 %d 摘要格式错误" % (pos, j))
+            chunk_digests.append(bytes.fromhex(c["digest"]))
+
+        recomputed = file_digest(rel_b, chunk_digests)
+        if recomputed.hex() != f["digest"]:
+            raise ProofFormatError("files[%d] 文件摘要与分块不一致" % pos)
+        file_digests.append(recomputed)
+        total_chunks += len(chunks)
+        parsed.append({"rel_b": rel_b, "chunks": chunks})
+
+    if root_digest(file_digests).hex() != rd:
+        raise ProofFormatError("根摘要与文件、分块内容不一致")
+    if isinstance(checked_size, int) and not isinstance(checked_size, bool) \
+            and checked_size != total_chunks:
+        raise ProofFormatError("total_chunks 与实际分块数不一致")
+
+    return obj, pid, parsed, total_chunks
+
+
+# ---------------------------------------------------------------------------
+# 确定性无放回抽样：以 PRF 键排序选取，同 proof_id/seed/k 结果恒定
+# ---------------------------------------------------------------------------
+
+def sample_key(pid_hex, seed_b, index):
+    h = hashlib.blake2b(digest_size=32)
+    h.update(b"sample\x00")
+    h.update(pid_hex.encode("ascii"))
+    h.update(b"\x00")
+    h.update(seed_b)
+    h.update(b"\x00")
+    h.update(str(index).encode("ascii"))
+    return h.digest()
+
+
+def choose_samples(pid_hex, seed_b, total, k):
+    """返回 k 个全局分块索引，按索引升序；要求 1 <= k <= total。"""
+    heap = None
+    for i in range(total):
+        item = (sample_key(pid_hex, seed_b, i), i)
+        if heap is None:
+            heap = [item]
+        elif len(heap) < k:
+            heapq.heappush(heap, item)
+        elif item < heap[0]:
+            heapq.heapreplace(heap, item)
+    return sorted(i for _, i in heap)
+
+
+# ---------------------------------------------------------------------------
+# 状态文件
+# ---------------------------------------------------------------------------
+
+def load_state(state_path):
+    if not os.path.exists(state_path):
+        return {}
+    try:
+        st = os.stat(state_path, follow_symlinks=False)
+    except OSError as e:
+        raise StateConflict("状态文件不可访问：%s" % e)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise StateConflict("状态路径存在但不是普通文件：%s" % state_path)
+    try:
+        with open(state_path, "rb") as f:
+            obj = json.loads(f.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise StateConflict("状态文件不可解析：%s" % e)
+
+    if not isinstance(obj, dict) or obj.get("version") != VERSION \
+            or not isinstance(obj.get("records"), dict):
+        raise StateConflict("状态文件结构不受支持或已损坏")
+    for pid, rec in obj["records"].items():
+        if not is_hex64(pid) or not isinstance(rec, dict) \
+                or rec.get("proof_id") != pid:
+            raise StateConflict("状态记录格式损坏")
+    return obj["records"]
+
+
+def save_state(state_path, records):
+    payload = {"version": VERSION, "records": records}
+    try:
+        atomic_write(state_path,
+                     (json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
+                     .encode("ascii"))
+    except OSError as e:
+        raise StateConflict("状态文件无法写入：%s" % e)
+
+
+# ---------------------------------------------------------------------------
+# proof challenge
+# ---------------------------------------------------------------------------
+
+def cmd_challenge(args):
+    _, pid, files, total = load_proof(args.proof)
+
+    k = args.samples  # argparse 已保证为正整数
+    if k > total:
+        raise ChallengeRangeError(
+            "请求样本数 %d 超过证明内分块总数 %d" % (k, total))
+
+    root_b = os.fsencode(os.path.abspath(args.root))
+    try:
+        rst = os.stat(root_b)
+    except OSError as e:
+        raise RootUnavailable("root 不可用：%s" % e)
+    if not stat.S_ISDIR(rst.st_mode):
+        raise RootUnavailable("root 不是目录：%s" % args.root)
+
+    seed_b = os.fsencode(args.seed)
+    selected = choose_samples(pid, seed_b, total, k)
+
+    # 全局分块索引 -> (文件下标, 块下标)
+    cum = [0]
+    for f in files:
+        cum.append(cum[-1] + len(f["chunks"]))
+
+    wanted = defaultdict(dict)  # file_idx -> {chunk_idx: global_idx}
+    for g in selected:
+        fi = bisect.bisect_right(cum, g) - 1
+        ci = g - cum[fi]
+        wanted[fi][ci] = g
+
+    # 每个抽中块的复核结果：match / mismatch / missing / error
+    outcome = {}
+
+    for fi, ci_map in wanted.items():
+        rel_b = files[fi]["rel_b"]
+        path_b = root_b + b"/" + rel_b
+        expected = {ci: bytes.fromhex(files[fi]["chunks"][ci]["digest"])
+                    for ci in ci_map}
+
+        try:
+            st = os.stat(path_b, follow_symlinks=False)
+        except FileNotFoundError:
+            st = None
+        except OSError:
+            st = None
+            for ci, g in ci_map.items():
+                outcome[g] = "error"
+            continue
+
+        if st is None or not stat.S_ISREG(st.st_mode):
+            # 原普通文件不存在，或已变成符号链接/目录等不可按原样检索的类型
+            for ci, g in ci_map.items():
+                outcome[g] = "missing"
+            continue
+
+        try:
+            actual = read_chunks(path_b)
+        except FileNotFoundError:
+            for ci, g in ci_map.items():
+                outcome[g] = "missing"
+            continue
+        except OSError:
+            for ci, g in ci_map.items():
+                outcome[g] = "error"
+            continue
+
+        actual_d = [digest(c) for c in actual]
+        for ci, g in ci_map.items():
+            if ci >= len(actual_d):
+                outcome[g] = "missing"      # 文件变短，目标块无法取得
+            elif actual_d[ci] != expected[ci]:
+                outcome[g] = "mismatch"
+            else:
+                outcome[g] = "match"
+
+    missing = sum(1 for v in outcome.values() if v == "missing")
+    mismatched = sum(1 for v in outcome.values() if v == "mismatch")
+    errors = sum(1 for v in outcome.values() if v == "error")
+    checked = sum(1 for v in outcome.values() if v in ("match", "mismatch"))
+
+    if errors:
+        failure_reason = "invalid"
+    elif missing:
+        failure_reason = "retrieval_missing"  # 缺失优先于不匹配
+    elif mismatched:
+        failure_reason = "content_mismatch"
+    else:
+        failure_reason = "none"
+    valid = failure_reason == "none"
+
+    hc = hashlib.blake2b(digest_size=32)
+    hc.update(b"challenge\x00")
+    hc.update(pid.encode("ascii"))
+    hc.update(b"\x00")
+    hc.update(seed_b)
+    hc.update(b"\x00")
+    hc.update(str(k).encode("ascii"))
+    challenge_id = hc.hexdigest()
+    ts = now_iso()
+
+    # 更新状态（按 proof_id 保留最新结果与累计计数）
+    records = load_state(args.state)
+    prev = records.get(pid, {})
+    records[pid] = {
+        "proof_id": pid,
+        "state": "valid" if valid else "invalid",
+        "failure_reason": failure_reason,
+        "last_challenge_id": challenge_id,
+        "last_seed": args.seed,
+        "last_samples": k,
+        "last_checked_at": ts,
+        "missing_samples": missing,
+        "mismatched_samples": mismatched,
+        "checked_samples": checked,
+        "challenge_count": prev.get("challenge_count", 0) + 1,
+        "cumulative": {
+            "requested": prev.get("cumulative", {}).get("requested", 0) + k,
+            "checked": prev.get("cumulative", {}).get("checked", 0) + checked,
+            "missing": prev.get("cumulative", {}).get("missing", 0) + missing,
+            "mismatched": prev.get("cumulative", {}).get("mismatched", 0)
+                          + mismatched,
+        },
+    }
+    save_state(args.state, records)
+
+    emit_json({
+        "challenge_id": challenge_id,
+        "proof_id": pid,
+        "seed": args.seed,
+        "requested_samples": k,
+        "checked_samples": checked,
+        "missing_samples": missing,
+        "mismatched_samples": mismatched,
+        "valid": valid,
+        "failure_reason": failure_reason,
+        "checked_at": ts,
+    })
+
+
+# ---------------------------------------------------------------------------
+# proof status
+# ---------------------------------------------------------------------------
+
+def cmd_status(args):
+    records = load_state(args.state)
+    out = []
+    for pid in sorted(records):
+        r = records[pid]
+        out.append({
+            "proof_id": pid,
+            "state": r["state"],
+            "checked_at": r["last_checked_at"],
+            "missing_samples": r["missing_samples"],
+            "mismatched_samples": r["mismatched_samples"],
+        })
+    emit_json(out)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+class StateProofParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise InputError(message)
+
+
+def positive_int(v):
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        raise InputError("--samples 必须是正整数")
+    if n <= 0:
+        raise InputError("--samples 必须是正整数")
+    return n
+
+
+def build_parser():
+    parser = StateProofParser(prog="stateproof")
+    sub = parser.add_subparsers(dest="command", required=True,
+                                parser_class=StateProofParser)
+
+    # 形如 `proof generate` 的两级入口：第一层固定为 proof
+    proof = sub.add_parser("proof")
+    psub = proof.add_subparsers(dest="action", required=True,
+                                parser_class=StateProofParser)
+
+    g = psub.add_parser("generate")
+    g.add_argument("--root", required=True)
+    g.add_argument("--proof", required=True)
+    g.set_defaults(func=cmd_generate)
+
+    c = psub.add_parser("challenge")
+    c.add_argument("--proof", required=True)
+    c.add_argument("--root", required=True)
+    c.add_argument("--state", required=True)
+    c.add_argument("--seed", required=True)
+    c.add_argument("--samples", required=True, type=positive_int)
+    c.set_defaults(func=cmd_challenge)
+
+    s = psub.add_parser("status")
+    s.add_argument("--state", required=True)
+    s.set_defaults(func=cmd_status)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+        args.func(args)
+    except CliError as e:
+        emit_error(e)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
