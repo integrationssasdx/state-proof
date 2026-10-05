@@ -1,4 +1,4 @@
-"""proof 命令行入口：generate / challenge / status / audit。
+"""proof 命令行入口：generate / challenge / status / audit / reconcile。
 
 成功：stdout 输出 JSON，退出码 0。
 受控失败：stderr 输出 {"error": {...}}，error.type 取
@@ -16,6 +16,7 @@ from .audit import run_audit
 from .challenge import parse_samples, run_challenge
 from .errors import InputError, StateProofError
 from .manifest import build_proof, load_proof
+from .reconcile import run_reconcile
 from .state import read_status
 
 
@@ -56,6 +57,10 @@ def build_parser():
     a = sub.add_parser("audit", add_help=True)
     a.add_argument("--proof", required=True)
     a.add_argument("--root", required=True)
+
+    r = sub.add_parser("reconcile", add_help=True)
+    r.add_argument("--proof", required=True)
+    r.add_argument("--root", required=True)
     return parser
 
 
@@ -106,11 +111,20 @@ def cmd_audit(args):
     return run_audit(proof, root)
 
 
+def cmd_reconcile(args):
+    proof_path = _require(args.proof, "--proof")
+    root = _require(args.root, "--root")
+    # 证明校验优先于 root 可用性检查（load_proof 在 scan_root 之前）。
+    proof = load_proof(proof_path)
+    return run_reconcile(proof, root)
+
+
 _HANDLERS = {
     "generate": cmd_generate,
     "challenge": cmd_challenge,
     "status": cmd_status,
     "audit": cmd_audit,
+    "reconcile": cmd_reconcile,
 }
 
 
@@ -119,7 +133,7 @@ def main(argv=None):
     try:
         args = parser.parse_args(argv)
         if not args.command:
-            raise InputError("缺少子命令：generate | challenge | status | audit")
+            raise InputError("缺少子命令：generate | challenge | status | audit | reconcile")
         result = _HANDLERS[args.command](args)
     except StateProofError as exc:
         _emit({"error": exc.to_dict()}, sys.stderr)
