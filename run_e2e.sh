@@ -316,6 +316,118 @@ $PROOF --version >/dev/null 2>&1; check "proof --version exit 0" 0 $?
 # ---------- status 错误参数 ----------
 $PROOF status 2>/dev/null; check "status without --state => exit 2" 2 $?
 
+# ---------- audit：全量核验（此刻数据树与 p.json 一致） ----------
+A=$($PROOF audit --proof "$WORK/p.json" --root "$ROOT")
+EC=$?
+check "audit valid exit" 0 "$EC"
+FC=$(python3 -c "import json;print(json.load(open('$WORK/p.json'))['file_count'])")
+echo "$A" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['proof_id']=='$PID1' and r['file_count']==$FC, r
+assert r['verified_files']==$FC, r
+assert r['missing_files']==[] and r['mismatched_files']==[], r
+assert r['valid'] is True and r['failure_reason']=='none', r"
+check "audit valid payload" 0 $?
+# 确定性：再跑输出完全一致
+A2=$($PROOF audit --proof "$WORK/p.json" --root "$ROOT")
+check "audit deterministic" "$A" "$A2"
+# 只读：root 下不产生/不改动任何文件
+SNAP_BEFORE=$(find "$ROOT" | sort)
+$PROOF audit --proof "$WORK/p.json" --root "$ROOT" >/dev/null
+SNAP_AFTER=$(find "$ROOT" | sort)
+check "audit is read-only on root" "$SNAP_BEFORE" "$SNAP_AFTER"
+# 成功时 stderr 为空
+ERR=$($PROOF audit --proof "$WORK/p.json" --root "$ROOT" 2>&1 >/dev/null)
+check "audit success stderr empty" "" "$ERR"
+
+# 缺失：移走文件 => retrieval_missing
+mv "$ROOT/sub/big.bin" "$WORK/big.bin.bak"
+A=$($PROOF audit --proof "$WORK/p.json" --root "$ROOT")
+echo "$A" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['valid'] is False and r['failure_reason']=='retrieval_missing', r
+assert r['missing_files']==['sub/big.bin'] and r['mismatched_files']==[], r
+assert r['verified_files']+len(r['missing_files'])==r['file_count'], r"
+check "audit missing => retrieval_missing" 0 $?
+mv "$WORK/big.bin.bak" "$ROOT/sub/big.bin"
+
+# 证明路径上是非普通文件（符号链接）=> 同样记 missing
+rm "$ROOT/a.txt"; ln -s sub "$ROOT/a.txt"
+A=$($PROOF audit --proof "$WORK/p.json" --root "$ROOT")
+echo "$A" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['valid'] is False and r['failure_reason']=='retrieval_missing', r
+assert r['missing_files']==['a.txt'], r"
+check "audit non-regular at proof path => missing" 0 $?
+rm "$ROOT/a.txt"; printf 'hello world\n' > "$ROOT/a.txt"
+
+# 不匹配：改内容 => content_mismatch
+printf 'CHANGED CONTENT' > "$ROOT/sub/deep/c.txt"
+A=$($PROOF audit --proof "$WORK/p.json" --root "$ROOT")
+echo "$A" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['valid'] is False and r['failure_reason']=='content_mismatch', r
+assert r['mismatched_files']==['sub/deep/c.txt'] and r['missing_files']==[], r
+assert r['verified_files']+len(r['mismatched_files'])==r['file_count'], r"
+check "audit mismatch => content_mismatch" 0 $?
+# 缺失优先于不匹配
+rm "$ROOT/a.txt"
+A=$($PROOF audit --proof "$WORK/p.json" --root "$ROOT")
+echo "$A" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['valid'] is False and r['failure_reason']=='retrieval_missing', r
+assert r['missing_files']==['a.txt'] and r['mismatched_files']==['sub/deep/c.txt'], r"
+check "audit missing takes priority over mismatch" 0 $?
+printf 'hello world\n' > "$ROOT/a.txt"; printf 'deep' > "$ROOT/sub/deep/c.txt"
+
+# 清单外新增文件忽略；空证明合法
+printf 'new file not in proof' > "$ROOT/audit-new.txt"
+$PROOF audit --proof "$WORK/p.json" --root "$ROOT" \
+  | python3 -c "import json,sys;r=json.load(sys.stdin);assert r['valid'] and r['verified_files']==$FC, r"
+check "audit ignores files not in proof" 0 $?
+rm -f "$ROOT/audit-new.txt"
+$PROOF audit --proof "$WORK/pe.json" --root "$WORK/empty-tree" \
+  | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['file_count']==0 and r['verified_files']==0, r
+assert r['valid'] is True and r['failure_reason']=='none', r"
+check "audit empty proof valid" 0 $?
+
+# audit 参数与错误
+ERR=$($PROOF audit --proof "" --root "$ROOT" 2>&1); EC=$?
+[ $EC -eq 2 ] && echo "$ERR" | grep -q InputError
+check "audit empty --proof => InputError/2" 0 $?
+ERR=$($PROOF audit --proof "$WORK/p.json" --root "" 2>&1); EC=$?
+[ $EC -eq 2 ] && echo "$ERR" | grep -q InputError
+check "audit empty --root => InputError/2" 0 $?
+$PROOF audit --proof "$WORK/p.json" 2>/dev/null; check "audit missing flags => exit 2" 2 $?
+$PROOF audit --proof "$WORK/p.json" --root "$ROOT" --samples 3 2>/dev/null
+check "audit rejects --samples => exit 2" 2 $?
+ERR=$($PROOF audit --proof "$WORK/nope.json" --root "$ROOT" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ProofFormatError'"
+check "audit missing proof => ProofFormatError" 0 $?
+ERR=$($PROOF audit --proof "$WORK/bad.json" --root "$ROOT" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ProofFormatError'"
+check "audit corrupt proof => ProofFormatError" 0 $?
+ERR=$($PROOF audit --proof "$WORK/tampered.json" --root "$ROOT" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ProofFormatError'"
+check "audit tampered proof => ProofFormatError" 0 $?
+ERR=$($PROOF audit --proof "$WORK/p.json" --root "$WORK/nope" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='RootUnavailable'"
+check "audit missing root => RootUnavailable" 0 $?
+ERR=$($PROOF audit --proof "$WORK/p.json" --root "$WORK/afile" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='RootUnavailable'"
+check "audit file as root => RootUnavailable" 0 $?
+# 受控失败时 stdout 为空
+OUT=$($PROOF audit --proof "$WORK/nope.json" --root "$ROOT" 2>/dev/null)
+check "audit error stdout empty" "" "$OUT"
+
 echo "----------------------------------------"
 echo "PASS=$pass FAIL=$fail"
 [ $fail -eq 0 ]

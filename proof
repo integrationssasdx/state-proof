@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""State Proof 命令行入口：proof generate | challenge | status。
+"""State Proof 命令行入口：proof generate | challenge | status | audit。
 
 可直接执行（./proof ...），仅依赖 Python 3.8+ 标准库。
 """

@@ -1,4 +1,4 @@
-"""proof 命令行入口：generate / challenge / status。
+"""proof 命令行入口：generate / challenge / status / audit。
 
 成功：stdout 输出 JSON，退出码 0。
 受控失败：stderr 输出 {"error": {...}}，error.type 取
@@ -12,6 +12,7 @@ import sys
 
 from . import __version__
 from .atomicio import atomic_write_json
+from .audit import run_audit
 from .challenge import parse_samples, run_challenge
 from .errors import InputError, StateProofError
 from .manifest import build_proof, load_proof
@@ -51,6 +52,10 @@ def build_parser():
 
     s = sub.add_parser("status", add_help=True)
     s.add_argument("--state", required=True)
+
+    a = sub.add_parser("audit", add_help=True)
+    a.add_argument("--proof", required=True)
+    a.add_argument("--root", required=True)
     return parser
 
 
@@ -94,10 +99,18 @@ def cmd_status(args):
     return read_status(state_path)
 
 
+def cmd_audit(args):
+    proof_path = _require(args.proof, "--proof")
+    root = _require(args.root, "--root")
+    proof = load_proof(proof_path)
+    return run_audit(proof, root)
+
+
 _HANDLERS = {
     "generate": cmd_generate,
     "challenge": cmd_challenge,
     "status": cmd_status,
+    "audit": cmd_audit,
 }
 
 
@@ -106,7 +119,7 @@ def main(argv=None):
     try:
         args = parser.parse_args(argv)
         if not args.command:
-            raise InputError("缺少子命令：generate | challenge | status")
+            raise InputError("缺少子命令：generate | challenge | status | audit")
         result = _HANDLERS[args.command](args)
     except StateProofError as exc:
         _emit({"error": exc.to_dict()}, sys.stderr)
