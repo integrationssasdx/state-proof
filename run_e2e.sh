@@ -316,6 +316,188 @@ $PROOF --version >/dev/null 2>&1; check "proof --version exit 0" 0 $?
 # ---------- status 错误参数 ----------
 $PROOF status 2>/dev/null; check "status without --state => exit 2" 2 $?
 
+# ---------- challenge-export / challenge-verify ----------
+# 导出凭证并与 challenge 的 challenge_id 交叉一致
+OUT=$($PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed seed-xyz --samples 4 --output "$WORK/resp.json")
+EC=$?
+check "challenge-export exit 0" 0 "$EC"
+echo "$OUT" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['valid'] is True and r['failure_reason']=='none' and r['samples']==4, r
+assert r['challenge_id']=='$CID_A' and r['proof_id']=='$PID1', r"
+check "export challenge_id matches challenge" 0 $?
+check "export evidence fields/data/digest" "export-evidence-ok" "$(python3 - "$WORK/resp.json" "$WORK/p.json" <<'PY'
+import base64, hashlib, json, sys
+R = json.load(open(sys.argv[1])); P = json.load(open(sys.argv[2]))
+ok = (R["version"] == 1 and R["format"] == "state-proof-challenge"
+      and R["proof_id"] == P["proof_id"] and R["samples"] == 4
+      and "requested_samples" not in R and len(R["challenge_id"]) == 64
+      and len(R["evidence"]) == 4)
+for e in R["evidence"]:
+    ok = ok and set(e) == {"path","chunk_index","offset","size","retrieval_status",
+                           "retrieved_size","digest","data"}
+    raw = base64.b64decode(e["data"], validate=True)
+    ok = ok and e["retrieval_status"] == "ok" and e["retrieved_size"] == e["size"] \
+        and len(raw) == e["size"] and e["offset"] == e["chunk_index"] * 65536 \
+        and hashlib.blake2b(raw, digest_size=32).hexdigest() == e["digest"]
+print("export-evidence-ok" if ok else "BAD")
+PY
+)"
+# 证据按全局块序
+python3 - "$WORK/resp.json" "$WORK/p.json" <<'PY'
+import json, sys
+R = json.load(open(sys.argv[1])); P = json.load(open(sys.argv[2]))
+flat = [(f["path"], c["index"]) for f in P["files"] for c in f["chunks"]]
+order = [flat.index((e["path"], e["chunk_index"])) for e in R["evidence"]]
+assert order == sorted(order) and len(set(order)) == len(order), order
+print("evidence-order-ok")
+PY
+check "evidence in global chunk order" 0 $?
+
+# verify 接受合法凭证
+OUT=$($PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/resp.json")
+EC=$?
+check "challenge-verify exit 0" 0 "$EC"
+echo "$OUT" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['proof_id']=='$PID1' and r['challenge_id']=='$CID_A', r
+assert r['valid'] is True and r['failure_reason']=='none' and r['verdict']=='valid', r
+assert r['samples']==4 and r['seed']=='seed-xyz', r"
+check "verify valid response payload" 0 $?
+
+# 缺失：删文件后导出 → retrieval_missing，verify 判 invalid
+rm "$ROOT/a.txt"
+$PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed seed-xyz --samples 8 --output "$WORK/resp-miss.json" \
+  | python3 -c "import json,sys;r=json.load(sys.stdin);assert r['valid'] is False and r['failure_reason']=='retrieval_missing', r"
+check "export missing => retrieval_missing" 0 $?
+python3 -c "
+import json
+r=json.load(open('$WORK/resp-miss.json'))
+ms=[e for e in r['evidence'] if e['retrieval_status']=='missing']
+assert ms and all(e['retrieved_size']==0 and e['digest'] is None and e['data'] is None for e in ms), ms"
+check "missing evidence fields" 0 $?
+$PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/resp-miss.json" \
+  | python3 -c "import json,sys;r=json.load(sys.stdin);assert r['verdict']=='invalid' and r['failure_reason']=='retrieval_missing', r"
+check "verify missing => invalid" 0 $?
+printf 'hello world\n' > "$ROOT/a.txt"
+
+# partial：截短文件 → 短读
+head -c 10 "$ROOT/sub/big.bin" > "$ROOT/sub/big.bin.tmp" && mv "$ROOT/sub/big.bin.tmp" "$ROOT/sub/big.bin"
+$PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed s --samples 8 --output "$WORK/resp-part.json" \
+  | python3 -c "import json,sys;r=json.load(sys.stdin);assert r['valid'] is False and r['failure_reason']=='content_mismatch', r"
+check "export partial => content_mismatch" 0 $?
+python3 -c "
+import json
+r=json.load(open('$WORK/resp-part.json'))
+ps=[e for e in r['evidence'] if e['retrieval_status']=='partial']
+assert ps and all(0<=e['retrieved_size']<e['size'] and e['digest'] and e['data'] is not None for e in ps), ps"
+check "partial evidence fields" 0 $?
+$PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/resp-part.json" \
+  | python3 -c "import json,sys;r=json.load(sys.stdin);assert r['verdict']=='invalid' and r['failure_reason']=='content_mismatch', r"
+check "verify partial => invalid" 0 $?
+head -c 200000 /dev/urandom > "$ROOT/sub/big.bin"  # 长度恢复但内容已变
+
+# 等长改写：ok 但摘要不符 → content_mismatch
+$PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed s --samples 8 --output "$WORK/resp-mod.json" \
+  | python3 -c "import json,sys;r=json.load(sys.stdin);assert r['valid'] is False and r['failure_reason']=='content_mismatch', r"
+check "export modified => content_mismatch" 0 $?
+$PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/resp-mod.json" \
+  | python3 -c "import json,sys;r=json.load(sys.stdin);assert r['verdict']=='invalid' and r['failure_reason']=='content_mismatch', r"
+check "verify modified => invalid" 0 $?
+# 恢复 big.bin 并重新生成证明，保持后续用例一致
+printf 'hello world\n' > "$ROOT/a.txt"
+$PROOF generate --root "$ROOT" --proof "$WORK/p.json" >/dev/null
+PID1=$(python3 -c "import json;print(json.load(open('$WORK/p.json'))['proof_id'])")
+$PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed seed-xyz --samples 4 --output "$WORK/resp.json" >/dev/null
+
+# 篡改响应：data / digest / 顺序 / challenge_id / 判定 → ResponseFormatError
+python3 -c "
+import base64, json
+r=json.load(open('$WORK/resp.json'))
+e=next(x for x in r['evidence'] if x['retrieval_status']=='ok')
+e['data']=base64.b64encode(b'X'+base64.b64decode(e['data'])[1:]).decode()
+json.dump(r,open('$WORK/t1.json','w'))"
+ERR=$($PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/t1.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ResponseFormatError
+check "tampered data => ResponseFormatError" 0 $?
+python3 -c "
+import json
+r=json.load(open('$WORK/resp.json'))
+r['evidence'][0],r['evidence'][1]=r['evidence'][1],r['evidence'][0]
+json.dump(r,open('$WORK/t2.json','w'))"
+ERR=$($PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/t2.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ResponseFormatError
+check "reordered evidence => ResponseFormatError" 0 $?
+python3 -c "
+import json
+r=json.load(open('$WORK/resp.json')); r['challenge_id']='0'*64
+json.dump(r,open('$WORK/t3.json','w'))"
+ERR=$($PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/t3.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ResponseFormatError
+check "tampered challenge_id => ResponseFormatError" 0 $?
+python3 -c "
+import json
+r=json.load(open('$WORK/resp.json')); r['valid']=False; r['failure_reason']='content_mismatch'
+json.dump(r,open('$WORK/t4.json','w'))"
+ERR=$($PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/t4.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ResponseFormatError
+check "tampered verdict => ResponseFormatError" 0 $?
+python3 -c "
+import json
+r=json.load(open('$WORK/resp.json')); r['format']='state-proof'
+json.dump(r,open('$WORK/t5.json','w'))"
+ERR=$($PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/t5.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ResponseFormatError
+check "wrong format => ResponseFormatError" 0 $?
+# 响应缺失 / 不可解析
+ERR=$($PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/no-resp.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ResponseFormatError
+check "missing response => ResponseFormatError" 0 $?
+echo '{not json' > "$WORK/badresp.json"
+ERR=$($PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/badresp.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ResponseFormatError
+check "corrupt response => ResponseFormatError" 0 $?
+# 拿别的证明核对响应 → ResponseFormatError
+printf 'other' > "$WORK/other-root-file"; mkdir -p "$WORK/other-root"; mv "$WORK/other-root-file" "$WORK/other-root/f"
+$PROOF generate --root "$WORK/other-root" --proof "$WORK/p-other.json" >/dev/null
+ERR=$($PROOF challenge-verify --proof "$WORK/p-other.json" --response "$WORK/resp.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ResponseFormatError
+check "response vs other proof => ResponseFormatError" 0 $?
+
+# export 参数与边界
+ERR=$($PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed s --samples 1 --output "$WORK/p.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q InputError
+check "output == proof => InputError" 0 $?
+ERR=$($PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed s --samples 0 --output "$WORK/x.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q InputError
+check "export bad samples => InputError" 0 $?
+ERR=$($PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed s --samples 99 --output "$WORK/x.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ChallengeRangeError
+check "export overrange => ChallengeRangeError" 0 $?
+ERR=$($PROOF challenge-export --proof "$WORK/p.json" --root "$WORK/nope" --seed s --samples 1 --output "$WORK/x.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q RootUnavailable
+check "export bad root => RootUnavailable" 0 $?
+ERR=$($PROOF challenge-export --proof "$WORK/missing-p.json" --root "$ROOT" --seed s --samples 1 --output "$WORK/x.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ProofFormatError
+check "export missing proof => ProofFormatError" 0 $?
+$PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed s 2>/dev/null
+check "export missing flags => exit 2" 2 $?
+$PROOF challenge-verify --proof "$WORK/p.json" 2>/dev/null
+check "verify missing flags => exit 2" 2 $?
+# export 不产生状态文件，也不读 --state
+$PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed s --samples 1 --output "$WORK/e1.json" >/dev/null
+ls "$ROOT"/*.json >/dev/null 2>&1 && check "export writes no state into root" 1 0 || check "export writes no state into root" 0 0
+# verify 越界 samples（响应声称超出总分块）
+python3 -c "
+import json
+r=json.load(open('$WORK/resp.json')); r['samples']=99
+json.dump(r,open('$WORK/t6.json','w'))"
+ERR=$($PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/t6.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ChallengeRangeError
+check "verify overrange samples => ChallengeRangeError" 0 $?
+
 echo "----------------------------------------"
 echo "PASS=$pass FAIL=$fail"
 [ $fail -eq 0 ]

@@ -1,19 +1,22 @@
-"""proof 命令行入口：generate / challenge / status / audit / reconcile。
+"""proof 命令行入口：generate / challenge / challenge-export / challenge-verify /
+status / audit / reconcile。
 
 成功：stdout 输出 JSON，退出码 0。
 受控失败：stderr 输出 {"error": {...}}，error.type 取
 InputError / RootUnavailable / ProofFormatError /
-ChallengeRangeError / StateConflict，退出码 2。
+ChallengeRangeError / ResponseFormatError / StateConflict，退出码 2。
 """
 
 import argparse
 import json
+import os
 import sys
 
 from . import __version__
 from .atomicio import atomic_write_json
 from .audit import run_audit
 from .challenge import parse_samples, run_challenge
+from .challenge_export import run_challenge_export, run_challenge_verify
 from .errors import InputError, StateProofError
 from .manifest import build_proof, load_proof
 from .reconcile import run_reconcile
@@ -50,6 +53,17 @@ def build_parser():
     c.add_argument("--state", required=True)
     c.add_argument("--seed", required=True)
     c.add_argument("--samples", required=True)
+
+    ce = sub.add_parser("challenge-export", add_help=True)
+    ce.add_argument("--proof", required=True)
+    ce.add_argument("--root", required=True)
+    ce.add_argument("--seed", required=True)
+    ce.add_argument("--samples", required=True)
+    ce.add_argument("--output", required=True)
+
+    cv = sub.add_parser("challenge-verify", add_help=True)
+    cv.add_argument("--proof", required=True)
+    cv.add_argument("--response", required=True)
 
     s = sub.add_parser("status", add_help=True)
     s.add_argument("--state", required=True)
@@ -99,6 +113,25 @@ def cmd_challenge(args):
     return run_challenge(proof, root, seed, samples, state_path)
 
 
+def cmd_challenge_export(args):
+    proof_path = _require(args.proof, "--proof")
+    root = _require(args.root, "--root")
+    seed = _require(args.seed, "--seed")
+    samples = parse_samples(args.samples)
+    output_path = _require(args.output, "--output")
+    if os.path.abspath(output_path) == os.path.abspath(proof_path):
+        raise InputError("--output 不能与 --proof 指向同一文件")
+    proof = load_proof(proof_path)
+    return run_challenge_export(proof, root, seed, samples, output_path)
+
+
+def cmd_challenge_verify(args):
+    proof_path = _require(args.proof, "--proof")
+    response_path = _require(args.response, "--response")
+    proof = load_proof(proof_path)
+    return run_challenge_verify(proof, response_path)
+
+
 def cmd_status(args):
     state_path = _require(args.state, "--state")
     return read_status(state_path)
@@ -122,6 +155,8 @@ def cmd_reconcile(args):
 _HANDLERS = {
     "generate": cmd_generate,
     "challenge": cmd_challenge,
+    "challenge-export": cmd_challenge_export,
+    "challenge-verify": cmd_challenge_verify,
     "status": cmd_status,
     "audit": cmd_audit,
     "reconcile": cmd_reconcile,
@@ -133,7 +168,10 @@ def main(argv=None):
     try:
         args = parser.parse_args(argv)
         if not args.command:
-            raise InputError("缺少子命令：generate | challenge | status | audit | reconcile")
+            raise InputError(
+                "缺少子命令：generate | challenge | challenge-export | "
+                "challenge-verify | status | audit | reconcile"
+            )
         result = _HANDLERS[args.command](args)
     except StateProofError as exc:
         _emit({"error": exc.to_dict()}, sys.stderr)
