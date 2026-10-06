@@ -10,7 +10,7 @@
 
 基线实现：`generate` / `challenge` / `status` / `audit` / `reconcile`，
 离线挑战凭证 `challenge-export` / `challenge-verify`，
-以及证明版本对账 `proof-diff`。
+证明版本对账 `proof-diff`，以及只读覆盖率报告 `coverage-report`。
 
 ## 离线挑战凭证
 
@@ -46,6 +46,27 @@
   全同则 `valid=true`、`failure_reason=none`，否则 `valid=false`、
   `failure_reason=proof_drift`。证明缺失、不可解析或不合证明格式 →
   `ProofFormatError`；缺参数或空路径 → `InputError`。
+
+## 只读覆盖率报告
+
+- `proof coverage-report --proof P --state S`
+  不访问 root、不写任何文件：先严格校验证明，再读取锚定于该 `proof_id` 的
+  状态历史（状态文件不存在按空历史处理）。沿用 `challenge` 的确定性选样语义，
+  按每条记录的 `seed` 与 `requested_samples` 重建互异的全局分块引用；
+  每条 `challenge_id` 必须能由选样、`valid`、`failure_reason` 重建一致，
+  否则报告失败。输出 `proof_id`、`total_chunks`、`covered_chunks`、
+  `uncovered_chunks`、`failed_challenges`、`failure_streak`、`valid`、
+  `failure_reason`。`uncovered_chunks` 按全局块序列 `path`、`chunk_index`；
+  `covered_chunks` 为至少被抽中一次的唯一分块数；`failed_challenges` 按历史
+  顺序列 `challenge_id`；`failure_streak` 只统计末尾连续无效记录数。
+  空历史时 `covered_chunks` 与 `failure_streak` 为 0、两个数组为空；证明含
+  分块则 `valid=false`、`failure_reason=coverage_gap`，空证明返回 `true`、
+  `none`。历史无效时一律 `false`、`challenge_failure`；否则有未覆盖块时
+  `false`、`coverage_gap`；全部覆盖且历史全有效时 `true`、`none`。
+  历史 `requested_samples` 超过 `total_chunks`，或空证明仍有历史时抛
+  `StateConflict`。参数缺失或空路径抛 `InputError`，证明非法抛
+  `ProofFormatError`，状态不可解析、跨 `proof_id`、计数矛盾或 `challenge_id`
+  重建不一致抛 `StateConflict`。
 
 ## 约定
 
