@@ -498,6 +498,119 @@ ERR=$($PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/t6.json" 
 [ $? -eq 2 ] && echo "$ERR" | grep -q ChallengeRangeError
 check "verify overrange samples => ChallengeRangeError" 0 $?
 
+# ---------- proof-diff：证明版本对账 ----------
+mkdir -p "$WORK/v1/sub"
+: > "$WORK/v1/empty.bin"
+printf 'hello\n' > "$WORK/v1/a.txt"
+head -c 200000 /dev/zero > "$WORK/v1/sub/big.bin"
+head -c 65536 /dev/zero > "$WORK/v1/sub/exact.bin"
+printf 'uni 名\tz' > "$WORK/v1/u.dat"
+printf 'nl\n' > "$WORK/v1/weird
+name.txt"
+$PROOF generate --root "$WORK/v1" --proof "$WORK/pb.json" >/dev/null
+PB=$(python3 -c "import json;print(json.load(open('$WORK/pb.json'))['proof_id'])")
+
+# 独立生成同数据 => 全同
+$PROOF generate --root "$WORK/v1" --proof "$WORK/pa-same.json" >/dev/null
+$PROOF proof-diff --before "$WORK/pb.json" --after "$WORK/pa-same.json" | python3 -c "
+import json,sys
+b=json.load(open('$WORK/pb.json')); d=json.load(sys.stdin)
+paths=sorted((f['path'] for f in b['files']), key=lambda p:p.encode())
+assert d['before_proof_id']==d['after_proof_id']=='$PB'
+assert d['before_file_count']==d['after_file_count']==len(paths)
+assert d['unchanged_files']==paths and d['added_files']==d['removed_files']==d['changed_files']==[]
+assert d['valid'] is True and d['failure_reason']=='none', d"
+check "proof-diff identical" 0 $?
+
+# 增 / 删 / 改
+mkdir -p "$WORK/v2"; cp -a "$WORK/v1/." "$WORK/v2/"
+rm "$WORK/v2/a.txt"
+printf 'new' > "$WORK/v2/new.txt"
+printf 'longer hello\n' > "$WORK/v2/empty.bin"
+python3 -c "
+p='$WORK/v2/sub/exact.bin'
+with open(p,'r+b') as f: b=f.read(1); f.seek(0); f.write(bytes([b[0]^0xFF]))
+p='$WORK/v2/sub/big.bin'
+with open(p,'r+b') as f: f.seek(65536); b=f.read(1); f.seek(65536); f.write(bytes([b[0]^0xFF]))"
+$PROOF generate --root "$WORK/v2" --proof "$WORK/pa.json" >/dev/null
+$PROOF proof-diff --before "$WORK/pb.json" --after "$WORK/pa.json" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['valid'] is False and d['failure_reason']=='proof_drift', d
+assert d['added_files']==['new.txt'] and d['removed_files']==['a.txt'], d
+assert d['unchanged_files']==['u.dat','weird\nname.txt'], d
+ch={c['path']:c for c in d['changed_files']}
+assert set(ch)=={'empty.bin','sub/big.bin','sub/exact.bin'}, ch
+assert ch['empty.bin']['reason']=='size_changed'
+assert ch['empty.bin']['changed_chunk_indices']==[]
+assert ch['empty.bin']['added_chunk_count']==1 and ch['empty.bin']['removed_chunk_count']==0
+assert ch['sub/exact.bin']['reason']=='digest_changed'
+assert ch['sub/exact.bin']['changed_chunk_indices']==[0]
+assert ch['sub/big.bin']['reason']=='digest_changed'
+assert ch['sub/big.bin']['changed_chunk_indices']==[1]
+assert ch['sub/big.bin']['added_chunk_count']==0 and ch['sub/big.bin']['removed_chunk_count']==0
+assert [c['path'] for c in d['changed_files']]==sorted(ch, key=lambda p:p.encode())
+assert 'weird\nname.txt' in d['unchanged_files'] and 'u.dat' in d['unchanged_files'], d"
+check "proof-diff added/removed/changed" 0 $?
+
+# 追加末尾块（200000->300000，4 块->5 块，原末块变满块）
+head -c 300000 /dev/zero > "$WORK/v2/sub/big.bin"
+$PROOF generate --root "$WORK/v2" --proof "$WORK/pa3.json" >/dev/null
+$PROOF proof-diff --before "$WORK/pb.json" --after "$WORK/pa3.json" | python3 -c "
+import json,sys
+c=[x for x in json.load(sys.stdin)['changed_files'] if x['path']=='sub/big.bin'][0]
+assert c['reason']=='size_changed' and c['added_chunk_count']==1 and c['removed_chunk_count']==0
+assert c['changed_chunk_indices']==[3], c"
+check "proof-diff appended chunk" 0 $?
+$PROOF proof-diff --before "$WORK/pa3.json" --after "$WORK/pb.json" | python3 -c "
+import json,sys
+c=[x for x in json.load(sys.stdin)['changed_files'] if x['path']=='sub/big.bin'][0]
+assert c['added_chunk_count']==0 and c['removed_chunk_count']==1, c"
+check "proof-diff removed chunk reverse" 0 $?
+
+# 空证明互比 / 空对非空
+mkdir -p "$WORK/ve1" "$WORK/ve2"
+$PROOF generate --root "$WORK/ve1" --proof "$WORK/pbe.json" >/dev/null
+$PROOF generate --root "$WORK/ve2" --proof "$WORK/pae.json" >/dev/null
+$PROOF proof-diff --before "$WORK/pbe.json" --after "$WORK/pae.json" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['before_file_count']==d['after_file_count']==0
+assert d['unchanged_files']==d['added_files']==d['removed_files']==d['changed_files']==[]
+assert d['valid'] is True and d['failure_reason']=='none' and d['before_proof_id']==d['after_proof_id'], d"
+check "proof-diff empty vs empty" 0 $?
+$PROOF proof-diff --before "$WORK/pbe.json" --after "$WORK/pb.json" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['valid'] is False and d['failure_reason']=='proof_drift'
+assert len(d['added_files'])==d['after_file_count'] and d['removed_files']==d['unchanged_files']==[], d"
+check "proof-diff empty vs nonempty" 0 $?
+
+# 错误路径
+ERR=$($PROOF proof-diff --before "$WORK/no-pf.json" --after "$WORK/pb.json" 2>&1)
+EC=$?
+check "proof-diff missing before => 2" 2 "$EC"
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ProofFormatError'"
+check "proof-diff missing before type" 0 $?
+echo '{nope' > "$WORK/badpf.json"
+ERR=$($PROOF proof-diff --before "$WORK/pb.json" --after "$WORK/badpf.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ProofFormatError'"
+check "proof-diff corrupt after type" 0 $?
+ERR=$($PROOF proof-diff --before "$WORK/no-pf.json" --after "$WORK/badpf.json" 2>&1)
+echo "$ERR" | grep -q "no-pf.json"
+check "proof-diff both invalid reports before" 0 $?
+$PROOF proof-diff --before "$WORK/pb.json" 2>/dev/null; check "proof-diff missing flag => 2" 2 $?
+ERR=$($PROOF proof-diff --before " " --after "$WORK/pb.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='InputError'"
+check "proof-diff blank path => InputError" 0 $?
+
+# 不读 root、不写文件
+SNAP1=$(ls -a "$WORK" | sort)
+$PROOF proof-diff --before "$WORK/pb.json" --after "$WORK/pa.json" >/dev/null
+SNAP2=$(ls -a "$WORK" | sort)
+[ "$SNAP1" == "$SNAP2" ]; check "proof-diff writes no files" 0 $?
+$PROOF proof-diff --help >/dev/null 2>&1; check "proof-diff --help exit 0" 0 $?
+
 echo "----------------------------------------"
 echo "PASS=$pass FAIL=$fail"
 [ $fail -eq 0 ]
