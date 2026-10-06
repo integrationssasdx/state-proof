@@ -42,6 +42,12 @@ class ChallengeRangeError(StateProofError):
     type = "ChallengeRangeError"
 
 
+class ResponseFormatError(StateProofError):
+    """挑战响应（离线凭证）缺失、不可解析，或结构/字段/证据/重建结果不合法。"""
+
+    type = "ResponseFormatError"
+
+
 class StateConflict(StateProofError):
     """状态冲突：状态文件不属于该 proof_id，或结构非法无法继续。"""
 
