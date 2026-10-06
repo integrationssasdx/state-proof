@@ -1,5 +1,5 @@
 """proof 命令行入口：generate / challenge / challenge-export / challenge-verify /
-status / audit / reconcile / proof-diff。
+status / audit / reconcile / proof-diff / coverage-report。
 
 成功：stdout 输出 JSON，退出码 0。
 受控失败：stderr 输出 {"error": {...}}，error.type 取
@@ -17,6 +17,7 @@ from .atomicio import atomic_write_json
 from .audit import run_audit
 from .challenge import parse_samples, run_challenge
 from .challenge_export import run_challenge_export, run_challenge_verify
+from .coverage import coverage_report
 from .errors import InputError, StateProofError
 from .manifest import build_proof, load_proof
 from .proof_diff import diff_proofs
@@ -80,6 +81,10 @@ def build_parser():
     pd = sub.add_parser("proof-diff", add_help=True)
     pd.add_argument("--before", required=True)
     pd.add_argument("--after", required=True)
+
+    cr = sub.add_parser("coverage-report", add_help=True)
+    cr.add_argument("--proof", required=True)
+    cr.add_argument("--state", required=True)
     return parser
 
 
@@ -166,6 +171,14 @@ def cmd_proof_diff(args):
     return diff_proofs(before, after)
 
 
+def cmd_coverage_report(args):
+    proof_path = _require(args.proof, "--proof")
+    state_path = _require(args.state, "--state")
+    # 只读：先严格校验证明，再按该 proof_id 校验状态历史；不访问 root。
+    proof = load_proof(proof_path)
+    return coverage_report(proof, state_path)
+
+
 _HANDLERS = {
     "generate": cmd_generate,
     "challenge": cmd_challenge,
@@ -175,6 +188,7 @@ _HANDLERS = {
     "audit": cmd_audit,
     "reconcile": cmd_reconcile,
     "proof-diff": cmd_proof_diff,
+    "coverage-report": cmd_coverage_report,
 }
 
 
@@ -185,7 +199,8 @@ def main(argv=None):
         if not args.command:
             raise InputError(
                 "缺少子命令：generate | challenge | challenge-export | "
-                "challenge-verify | status | audit | reconcile | proof-diff"
+                "challenge-verify | status | audit | reconcile | proof-diff | "
+                "coverage-report"
             )
         result = _HANDLERS[args.command](args)
     except StateProofError as exc:

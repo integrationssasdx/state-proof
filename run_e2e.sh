@@ -611,6 +611,154 @@ SNAP2=$(ls -a "$WORK" | sort)
 [ "$SNAP1" == "$SNAP2" ]; check "proof-diff writes no files" 0 $?
 $PROOF proof-diff --help >/dev/null 2>&1; check "proof-diff --help exit 0" 0 $?
 
+# ---------- coverage-report：只读覆盖率报告 ----------
+mkdir -p "$WORK/cov"
+printf 'hello\n' > "$WORK/cov/a.txt"                 # 1 块
+head -c 200000 /dev/urandom > "$WORK/cov/b.bin"     # 4 块
+head -c 65536 /dev/urandom > "$WORK/cov/c.bin"      # 1 块
+$PROOF generate --root "$WORK/cov" --proof "$WORK/pcov.json" >/dev/null
+PCOV=$(python3 -c "import json;print(json.load(open('$WORK/pcov.json'))['proof_id'])")
+
+# 状态不存在 => 空历史：covered=0、streak=0、数组空，uncovered 为全局块序全表
+$PROOF coverage-report --proof "$WORK/pcov.json" --state "$WORK/scov.json" | python3 -c "
+import json,sys
+P=json.load(open('$WORK/pcov.json'))
+flat=[{'path':f['path'],'chunk_index':c['index']} for f in P['files'] for c in f['chunks']]
+r=json.load(sys.stdin)
+assert r['proof_id']=='$PCOV' and r['total_chunks']==6 and r['covered_chunks']==0, r
+assert r['failure_streak']==0 and r['failed_challenges']==[], r
+assert r['uncovered_chunks']==flat, r
+assert r['valid'] is False and r['failure_reason']=='coverage_gap', r"
+check "coverage empty history => coverage_gap" 0 $?
+
+# 多条部分抽样：用独立实现复算选样并集，与报告交叉验证
+for sd in c1 c2 c3 c4; do
+  $PROOF challenge --proof "$WORK/pcov.json" --root "$WORK/cov" --state "$WORK/scov.json" --seed "$sd" --samples 2 >/dev/null
+done
+# 同 seed 复跑：历史不增加，覆盖集合不变
+$PROOF challenge --proof "$WORK/pcov.json" --root "$WORK/cov" --state "$WORK/scov.json" --seed c1 --samples 2 >/dev/null
+$PROOF coverage-report --proof "$WORK/pcov.json" --state "$WORK/scov.json" | python3 -c "
+import hashlib,json,sys
+P=json.load(open('$WORK/pcov.json')); S=json.load(open('$WORK/scov.json'))
+flat=[(f['path'],c['index']) for f in P['files'] for c in f['chunks']]
+total=len(flat); pid=P['proof_id']
+def select(seed,n):
+  m=hashlib.blake2b(b'stateproof-challenge-v1|proof:'+pid.encode()+b'|seed:'+seed.encode(),digest_size=32).digest()
+  st=int.from_bytes(m[:8],'big'); mask=(1<<64)-1
+  def nxt():
+    nonlocal st
+    st=(st+0x9E3779B97F4A7C15)&mask; z=st
+    z=((z^(z>>30))*0xBF58476D1CE4E5B9)&mask
+    z=((z^(z>>27))*0x94D049BB133111EB)&mask
+    return z^(z>>31)
+  idx=list(range(total))
+  for i in range(n):
+    j=i+nxt()%(total-i); idx[i],idx[j]=idx[j],idx[i]
+  return sorted(idx[:n])
+covered=set()
+for h in S['history']:
+  covered.update(select(h['seed'],h['requested_samples']))
+expect_un=[{'path':flat[g][0],'chunk_index':flat[g][1]} for g in range(total) if g not in covered]
+r=json.load(sys.stdin)
+assert len(S['history'])==4, S['history']
+assert r['covered_chunks']==len(covered), r
+assert r['uncovered_chunks']==expect_un, r
+assert r['failed_challenges']==[] and r['failure_streak']==0, r
+assert r['valid'] is (len(covered)==total), r
+assert r['failure_reason']==('none' if len(covered)==total else 'coverage_gap'), r"
+check "coverage partial history cross-recomputed" 0 $?
+
+# 全量抽样 => 全覆盖、true/none
+$PROOF challenge --proof "$WORK/pcov.json" --root "$WORK/cov" --state "$WORK/scov.json" --seed full --samples 6 >/dev/null
+$PROOF coverage-report --proof "$WORK/pcov.json" --state "$WORK/scov.json" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['covered_chunks']==6 and r['uncovered_chunks']==[], r
+assert r['valid'] is True and r['failure_reason']=='none' and r['failure_streak']==0, r"
+check "coverage full => valid none" 0 $?
+
+# 失效历史：invalid, valid, invalid（末尾 streak=1，failed 按历史顺序共 2 条）
+rm "$WORK/cov/a.txt"
+$PROOF challenge --proof "$WORK/pcov.json" --root "$WORK/cov" --state "$WORK/scov.json" --seed f1 --samples 6 >/dev/null
+printf 'hello\n' > "$WORK/cov/a.txt"
+$PROOF challenge --proof "$WORK/pcov.json" --root "$WORK/cov" --state "$WORK/scov.json" --seed g1 --samples 6 >/dev/null
+rm "$WORK/cov/a.txt"
+$PROOF challenge --proof "$WORK/pcov.json" --root "$WORK/cov" --state "$WORK/scov.json" --seed f2 --samples 6 >/dev/null
+$PROOF coverage-report --proof "$WORK/pcov.json" --state "$WORK/scov.json" | python3 -c "
+import json,sys
+S=json.load(open('$WORK/scov.json'))
+bad=[h['challenge_id'] for h in S['history'] if not h['valid']]
+r=json.load(sys.stdin)
+assert r['valid'] is False and r['failure_reason']=='challenge_failure', r
+assert r['failed_challenges']==bad and len(bad)==2, r
+assert r['failure_streak']==1, r"
+check "coverage failures ordered with trailing streak" 0 $?
+# 再追加一条失效 => streak=2；历史中任何无效都判 challenge_failure
+$PROOF challenge --proof "$WORK/pcov.json" --root "$WORK/cov" --state "$WORK/scov.json" --seed f3 --samples 6 >/dev/null
+$PROOF coverage-report --proof "$WORK/pcov.json" --state "$WORK/scov.json" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['failure_streak']==2 and r['failure_reason']=='challenge_failure' and not r['valid'], r"
+check "coverage streak grows" 0 $?
+printf 'hello\n' > "$WORK/cov/a.txt"
+
+# 空证明：空历史 => true/none
+$PROOF coverage-report --proof "$WORK/pe.json" --state "$WORK/scov-empty.json" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['total_chunks']==0 and r['covered_chunks']==0 and r['failure_streak']==0
+assert r['uncovered_chunks']==[] and r['failed_challenges']==[]
+assert r['valid'] is True and r['failure_reason']=='none', r"
+check "coverage empty proof empty history" 0 $?
+# 空证明但状态属于别的 proof_id（有历史）=> StateConflict
+ERR=$($PROOF coverage-report --proof "$WORK/pe.json" --state "$WORK/scov.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='StateConflict'"
+check "coverage empty proof with history => StateConflict" 0 $?
+
+# 错误路径
+ERR=$($PROOF coverage-report --proof "$WORK/p-other.json" --state "$WORK/scov.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='StateConflict'"
+check "coverage cross proof_id => StateConflict" 0 $?
+echo '???' > "$WORK/badcov.json"
+ERR=$($PROOF coverage-report --proof "$WORK/pcov.json" --state "$WORK/badcov.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='StateConflict'"
+check "coverage corrupt state => StateConflict" 0 $?
+python3 -c "
+import json
+s=json.load(open('$WORK/scov.json'))
+s['history'][0]['challenge_id']='0'*64
+json.dump(s,open('$WORK/covtamper.json','w'))"
+ERR=$($PROOF coverage-report --proof "$WORK/pcov.json" --state "$WORK/covtamper.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='StateConflict'"
+check "coverage rebuilt challenge_id mismatch => StateConflict" 0 $?
+python3 -c "
+import json
+s=json.load(open('$WORK/scov.json'))
+s['history'][0]['requested_samples']=99; s['history'][0]['checked_samples']=99
+json.dump(s,open('$WORK/covover.json','w'))"
+ERR=$($PROOF coverage-report --proof "$WORK/pcov.json" --state "$WORK/covover.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='StateConflict'"
+check "coverage samples over total => StateConflict" 0 $?
+ERR=$($PROOF coverage-report --proof "$WORK/no-pf.json" --state "$WORK/scov.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ProofFormatError'"
+check "coverage missing proof => ProofFormatError" 0 $?
+ERR=$($PROOF coverage-report --proof " " --state "$WORK/scov.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='InputError'"
+check "coverage blank proof path => InputError" 0 $?
+$PROOF coverage-report --proof "$WORK/pcov.json" 2>/dev/null
+check "coverage missing --state => exit 2" 2 $?
+
+# 只读、不访问 root：root 移走后仍可报告，且无文件写入
+SNAPC=$(ls -a "$WORK" | sort)
+mv "$WORK/cov" "$WORK/cov-moved"
+$PROOF coverage-report --proof "$WORK/pcov.json" --state "$WORK/scov.json" >/dev/null
+EC=$?
+mv "$WORK/cov-moved" "$WORK/cov"
+check "coverage runs without root access" 0 "$EC"
+SNAPD=$(ls -a "$WORK" | sort)
+[ "$SNAPC" == "$SNAPD" ]; check "coverage-report writes no files" 0 $?
+$PROOF coverage-report --help >/dev/null 2>&1; check "coverage-report --help exit 0" 0 $?
+
 echo "----------------------------------------"
 echo "PASS=$pass FAIL=$fail"
 [ $fail -eq 0 ]
