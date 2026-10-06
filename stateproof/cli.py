@@ -1,5 +1,5 @@
 """proof 命令行入口：generate / challenge / challenge-export / challenge-verify /
-status / audit / reconcile。
+status / audit / reconcile / proof-diff。
 
 成功：stdout 输出 JSON，退出码 0。
 受控失败：stderr 输出 {"error": {...}}，error.type 取
@@ -19,6 +19,7 @@ from .challenge import parse_samples, run_challenge
 from .challenge_export import run_challenge_export, run_challenge_verify
 from .errors import InputError, StateProofError
 from .manifest import build_proof, load_proof
+from .proof_diff import run_proof_diff
 from .reconcile import run_reconcile
 from .state import read_status
 
@@ -75,6 +76,10 @@ def build_parser():
     r = sub.add_parser("reconcile", add_help=True)
     r.add_argument("--proof", required=True)
     r.add_argument("--root", required=True)
+
+    pd = sub.add_parser("proof-diff", add_help=True)
+    pd.add_argument("--before", required=True)
+    pd.add_argument("--after", required=True)
     return parser
 
 
@@ -152,6 +157,15 @@ def cmd_reconcile(args):
     return run_reconcile(proof, root)
 
 
+def cmd_proof_diff(args):
+    before_path = _require(args.before, "--before")
+    after_path = _require(args.after, "--after")
+    # 先验 before 再验 after；两份都非法时报 before。不读 root、不写文件。
+    before_proof = load_proof(before_path)
+    after_proof = load_proof(after_path)
+    return run_proof_diff(before_proof, after_proof)
+
+
 _HANDLERS = {
     "generate": cmd_generate,
     "challenge": cmd_challenge,
@@ -160,6 +174,7 @@ _HANDLERS = {
     "status": cmd_status,
     "audit": cmd_audit,
     "reconcile": cmd_reconcile,
+    "proof-diff": cmd_proof_diff,
 }
 
 
@@ -170,7 +185,7 @@ def main(argv=None):
         if not args.command:
             raise InputError(
                 "缺少子命令：generate | challenge | challenge-export | "
-                "challenge-verify | status | audit | reconcile"
+                "challenge-verify | status | audit | reconcile | proof-diff"
             )
         result = _HANDLERS[args.command](args)
     except StateProofError as exc:
