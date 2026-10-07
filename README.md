@@ -9,7 +9,7 @@
 ## 状态
 
 基线实现：`generate` / `challenge` / `status` / `audit` / `reconcile`，
-离线挑战凭证 `challenge-export` / `challenge-verify`，
+离线挑战凭证 `challenge-export` / `challenge-verify` / `challenge-import`，
 证明版本对账 `proof-diff`，以及只读覆盖率报告 `coverage-report`。
 
 ## 离线挑战凭证
@@ -29,6 +29,29 @@
   Base64、长度与摘要，重建议定与 `challenge_id`，输出 `proof_id`、`challenge_id`、
   `seed`、`samples`、`valid`、`failure_reason` 与唯一判定 `verdict`。
   响应缺失/不可解析/版本格式/证据/重建/`challenge_id` 不合法 → `ResponseFormatError`。
+- `proof challenge-import --proof P --state S --response R`
+  三个路径必填且非空；只读 proof 与 response、不访问 root，通过后原子写 state。
+  先严格校验证明，再按 `challenge-verify` 的同一套校验核对 response，由
+  `proof_id`、`seed`、`samples` 重建选样；证据按重建顺序（全局块序）逐条
+  对应，Base64、长度、摘要一致，`valid`、`failure_reason`、`challenge_id`
+  与重建一致。成功后向该 `proof_id` 的 `state.history` 追加一条导入记录：
+  `seed`、`samples`、`checked_samples`、`missing_samples`、
+  `mismatched_samples`、`valid`、`failure_reason`、时间戳 `imported_at`，
+  其中 `checked_samples=ok+partial`、`missing_samples=missing`、
+  `mismatched_samples=partial 或摘要不符`。输出 `proof_id`、`challenge_id`、
+  `seed`、`samples`、`checked_samples`、`missing_samples`、
+  `mismatched_samples`、`valid`、`failure_reason`、`imported`：首次导入
+  `imported=true`；同一 `challenge_id` 且计数判定相同的重复导入
+  `imported=false` 且不改写 state。
+  - 缺参数或空路径 → `InputError`；proof 缺失、不可解析或格式非法 →
+    `ProofFormatError`；response 缺失、不可解析或字段/顺序/Base64/长度/摘要/
+    判定/`challenge_id` 不一致 → `ResponseFormatError`；`samples` 越界 →
+    `ChallengeRangeError`。state 不存在按空历史创建；state 跨 `proof_id`、
+    历史非法，或同一 `challenge_id` 既有结果与导入响应不一致 →
+    `StateConflict`。
+  - 历史同时容纳在线记录（`requested_samples` / `challenged_at`）与导入记录
+    （`samples` / `imported_at`），顺序保留；`challenge` 仍从 root 重读并写
+    state，`challenge-verify` 仍只读，二者行为不变。
 
 ## 证明版本对账
 

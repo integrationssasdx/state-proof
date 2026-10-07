@@ -203,8 +203,14 @@ def _check_evidence_entry(entry, index, fe, chunk_idx, chunk_size):
     return status, digest == chunk["digest"]
 
 
-def run_challenge_verify(proof, response_path):
-    """校验离线挑战凭证，返回判定 dict；任何不合法抛 ResponseFormatError。"""
+def verify_response(proof, response_path):
+    """校验离线挑战凭证，返回结构化判定 dict。
+
+    任何不合法抛 ResponseFormatError；samples 越界抛 ChallengeRangeError。
+    返回字段：proof_id、challenge_id、seed、samples、valid、failure_reason，
+    以及按重建选样顺序（全局块序）分类的引用列表 checked_samples（ok+partial）、
+    missing_samples（missing）、mismatched_samples（partial 或摘要不符）。
+    """
     resp = _load_response(response_path)
 
     if resp.get("version") != VERSION:
@@ -243,11 +249,13 @@ def run_challenge_verify(proof, response_path):
         )
 
     statuses_match = []
+    refs = []
     for i, gi in enumerate(chosen):
         fe, chunk_idx, _ = flat[gi]
         statuses_match.append(
             _check_evidence_entry(evidence[i], i, fe, chunk_idx, proof["chunk_size"])
         )
+        refs.append({"path": fe["path"], "chunk_index": chunk_idx})
 
     # 重建议定与 challenge_id，响应声明必须与之完全一致。
     rebuilt_valid, rebuilt_reason = _judge(statuses_match)
@@ -259,6 +267,17 @@ def run_challenge_verify(proof, response_path):
     if challenge_id != expected_id:
         raise ResponseFormatError("响应 challenge_id 与重建结果不一致")
 
+    checked, missing, mismatched = [], [], []
+    for ref, (status, digest_match) in zip(refs, statuses_match):
+        if status == "missing":
+            # missing 只计缺失；其 digest_match 恒为 False，不得再进 mismatched。
+            missing.append(ref)
+            continue
+        # ok 与 partial 都属于已取回（checked）。
+        checked.append(ref)
+        if status == "partial" or not digest_match:
+            mismatched.append(ref)
+
     return {
         "proof_id": proof["proof_id"],
         "challenge_id": challenge_id,
@@ -266,5 +285,21 @@ def run_challenge_verify(proof, response_path):
         "samples": samples,
         "valid": rebuilt_valid,
         "failure_reason": rebuilt_reason,
-        "verdict": "valid" if rebuilt_valid else "invalid",
+        "checked_samples": checked,
+        "missing_samples": missing,
+        "mismatched_samples": mismatched,
+    }
+
+
+def run_challenge_verify(proof, response_path):
+    """challenge-verify：只读校验，输出判定与唯一 verdict，不访问 root、不写文件。"""
+    outcome = verify_response(proof, response_path)
+    return {
+        "proof_id": outcome["proof_id"],
+        "challenge_id": outcome["challenge_id"],
+        "seed": outcome["seed"],
+        "samples": outcome["samples"],
+        "valid": outcome["valid"],
+        "failure_reason": outcome["failure_reason"],
+        "verdict": "valid" if outcome["valid"] else "invalid",
     }

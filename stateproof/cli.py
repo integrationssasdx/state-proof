@@ -17,6 +17,7 @@ from .atomicio import atomic_write_json
 from .audit import run_audit
 from .challenge import parse_samples, run_challenge
 from .challenge_export import run_challenge_export, run_challenge_verify
+from .challenge_import import run_challenge_import
 from .coverage import coverage_report
 from .errors import InputError, StateProofError
 from .manifest import build_proof, load_proof
@@ -66,6 +67,11 @@ def build_parser():
     cv = sub.add_parser("challenge-verify", add_help=True)
     cv.add_argument("--proof", required=True)
     cv.add_argument("--response", required=True)
+
+    ci = sub.add_parser("challenge-import", add_help=True)
+    ci.add_argument("--proof", required=True)
+    ci.add_argument("--state", required=True)
+    ci.add_argument("--response", required=True)
 
     s = sub.add_parser("status", add_help=True)
     s.add_argument("--state", required=True)
@@ -142,6 +148,15 @@ def cmd_challenge_verify(args):
     return run_challenge_verify(proof, response_path)
 
 
+def cmd_challenge_import(args):
+    proof_path = _require(args.proof, "--proof")
+    state_path = _require(args.state, "--state")
+    response_path = _require(args.response, "--response")
+    # 只读 proof、response，原子写 state；不访问 root。
+    proof = load_proof(proof_path)
+    return run_challenge_import(proof, state_path, response_path)
+
+
 def cmd_status(args):
     state_path = _require(args.state, "--state")
     return read_status(state_path)
@@ -184,6 +199,7 @@ _HANDLERS = {
     "challenge": cmd_challenge,
     "challenge-export": cmd_challenge_export,
     "challenge-verify": cmd_challenge_verify,
+    "challenge-import": cmd_challenge_import,
     "status": cmd_status,
     "audit": cmd_audit,
     "reconcile": cmd_reconcile,
@@ -199,8 +215,8 @@ def main(argv=None):
         if not args.command:
             raise InputError(
                 "缺少子命令：generate | challenge | challenge-export | "
-                "challenge-verify | status | audit | reconcile | proof-diff | "
-                "coverage-report"
+                "challenge-verify | challenge-import | status | audit | "
+                "reconcile | proof-diff | coverage-report"
             )
         result = _HANDLERS[args.command](args)
     except StateProofError as exc:

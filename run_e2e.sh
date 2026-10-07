@@ -759,6 +759,146 @@ SNAPD=$(ls -a "$WORK" | sort)
 [ "$SNAPC" == "$SNAPD" ]; check "coverage-report writes no files" 0 $?
 $PROOF coverage-report --help >/dev/null 2>&1; check "coverage-report --help exit 0" 0 $?
 
+# ---------- challenge-import：离线凭证导入同一证明的 state.history ----------
+# 复用 cov 数据与证明；新建独立状态避免既存历史干扰
+$PROOF challenge-export --proof "$WORK/pcov.json" --root "$WORK/cov" --seed imp1 --samples 3 --output "$WORK/imp-r.json" >/dev/null
+IMP_CID=$($PROOF challenge-verify --proof "$WORK/pcov.json" --response "$WORK/imp-r.json" \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['challenge_id'])")
+$PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/si.json" --response "$WORK/imp-r.json" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['proof_id']=='$PCOV' and r['challenge_id']=='$IMP_CID', r
+assert r['seed']=='imp1' and r['samples']==3 and r['checked_samples']==3, r
+assert r['missing_samples']==0 and r['mismatched_samples']==0, r
+assert r['valid'] is True and r['failure_reason']=='none' and r['imported'] is True, r"
+check "import valid payload" 0 $?
+# 落盘为导入形态 samples/imported_at，顺序保留
+python3 - "$WORK/si.json" <<'PY'
+import json,sys
+h=json.load(open(sys.argv[1]))["history"]
+assert len(h)==1 and set(h[0])=={
+  "challenge_id","seed","samples","checked_samples","missing_samples",
+  "mismatched_samples","valid","failure_reason","imported_at"}, h[0]
+assert "requested_samples" not in h[0] and "challenged_at" not in h[0]
+print("import-record-shape-ok")
+PY
+check "import record shape" 0 $?
+# 重复导入：imported=false，文件不变、历史不增加
+cp "$WORK/si.json" "$WORK/si.before"
+$PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/si.json" --response "$WORK/imp-r.json" \
+  | python3 -c "import json,sys;r=json.load(sys.stdin);assert r['imported'] is False and r['valid'] is True, r"
+check "import idempotent imported=false" 0 $?
+cmp -s "$WORK/si.json" "$WORK/si.before"; check "import idempotent leaves state byte-identical" 0 $?
+python3 -c "import json;assert json.load(open('$WORK/si.json'))['total_challenges']==1"
+check "import idempotent history unchanged" 0 $?
+
+# 与在线挑战共享同一历史（不同 challenge_id），两种形态并存且形态在写回后保留
+$PROOF challenge --proof "$WORK/pcov.json" --root "$WORK/cov" --state "$WORK/si.json" --seed imp-online --samples 2 >/dev/null
+$PROOF challenge-export --proof "$WORK/pcov.json" --root "$WORK/cov" --seed imp2 --samples 2 --output "$WORK/imp-r2.json" >/dev/null
+$PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/si.json" --response "$WORK/imp-r2.json" >/dev/null
+python3 - "$WORK/si.json" <<'PY'
+import json,sys
+h=json.load(open(sys.argv[1]))["history"]
+assert len(h)==3, h
+assert "samples" in h[0] and "imported_at" in h[0], h[0]
+assert "requested_samples" in h[1] and "challenged_at" in h[1], h[1]
+assert "samples" in h[2] and "imported_at" in h[2], h[2]
+print("mixed-history-shape-ok")
+PY
+check "import mixed history preserves shapes/order" 0 $?
+# coverage-report 能纳入导入记录并重建 challenge_id
+$PROOF coverage-report --proof "$WORK/pcov.json" --state "$WORK/si.json" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['covered_chunks']>0 and r['failure_streak']==0 and r['failed_challenges']==[], r"
+check "coverage includes imported history" 0 $?
+# 在线挑战先写入，再导入同 seed/samples（同 challenge_id）→ 跨形态幂等
+$PROOF challenge --proof "$WORK/pcov.json" --root "$WORK/cov" --state "$WORK/si2.json" --seed xs --samples 2 >/dev/null
+$PROOF challenge-export --proof "$WORK/pcov.json" --root "$WORK/cov" --seed xs --samples 2 --output "$WORK/imp-xs.json" >/dev/null
+$PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/si2.json" --response "$WORK/imp-xs.json" \
+  | python3 -c "import json,sys;assert json.load(sys.stdin)['imported'] is False"
+check "import idempotent across record shapes" 0 $?
+
+# 缺失/partial 分类：checked=ok+partial，missing=missing，mismatched=partial或摘要不符
+rm "$WORK/cov/a.txt"
+$PROOF challenge-export --proof "$WORK/pcov.json" --root "$WORK/cov" --seed imp-bad --samples 6 --output "$WORK/imp-miss.json" >/dev/null
+$PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/sib.json" --response "$WORK/imp-miss.json" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['valid'] is False and r['failure_reason']=='retrieval_missing', r
+assert r['missing_samples']>=1 and r['mismatched_samples']==0, r
+assert r['checked_samples']+r['missing_samples']==6, r"
+check "import missing classification" 0 $?
+printf 'hello\n' > "$WORK/cov/a.txt"
+$PROOF coverage-report --proof "$WORK/pcov.json" --state "$WORK/sib.json" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['valid'] is False and r['failure_reason']=='challenge_failure' and r['failure_streak']==1, r"
+check "coverage sees imported failure" 0 $?
+
+# 只读 proof/response、不访问 root：root 移走后仍可导入，且不改 response
+RESP_HASH=$(sha256sum "$WORK/imp-r.json" | cut -d' ' -f1)
+mv "$WORK/cov" "$WORK/cov-moved2"
+$PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/si3.json" --response "$WORK/imp-r.json" >/dev/null
+check "import runs without root" 0 $?
+[ "$(sha256sum "$WORK/imp-r.json" | cut -d' ' -f1)" == "$RESP_HASH" ]
+check "import leaves response untouched" 0 $?
+mv "$WORK/cov-moved2" "$WORK/cov"
+
+# 错误路径
+$PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/x.json" 2>/dev/null
+check "import missing flag => exit 2" 2 $?
+ERR=$($PROOF challenge-import --proof " " --state "$WORK/x.json" --response "$WORK/imp-r.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='InputError'"
+check "import blank path => InputError" 0 $?
+ERR=$($PROOF challenge-import --proof "$WORK/no-pf.json" --state "$WORK/x.json" --response "$WORK/imp-r.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ProofFormatError'"
+check "import missing proof => ProofFormatError" 0 $?
+ERR=$($PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/x.json" --response "$WORK/no-resp.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ResponseFormatError'"
+check "import missing response => ResponseFormatError" 0 $?
+# 篡改响应（顺序/判定/challenge_id）→ ResponseFormatError
+python3 -c "
+import json
+r=json.load(open('$WORK/imp-r.json')); r['evidence'][0],r['evidence'][1]=r['evidence'][1],r['evidence'][0]
+json.dump(r,open('$WORK/imp-t1.json','w'))"
+ERR=$($PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/x.json" --response "$WORK/imp-t1.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ResponseFormatError'"
+check "import reordered evidence => ResponseFormatError" 0 $?
+python3 -c "
+import json
+r=json.load(open('$WORK/imp-r.json')); r['samples']=99
+json.dump(r,open('$WORK/imp-t2.json','w'))"
+ERR=$($PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/x.json" --response "$WORK/imp-t2.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ChallengeRangeError'"
+check "import overrange samples => ChallengeRangeError" 0 $?
+[ ! -e "$WORK/x.json" ]; check "import validation failure writes no state" 0 $?
+# 状态跨 proof_id：构造属于 p-other 的合法响应，再导入属于 pcov 的状态
+$PROOF challenge-export --proof "$WORK/p-other.json" --root "$WORK/other-root" --seed z --samples 1 --output "$WORK/ro-other.json" >/dev/null
+ERR=$($PROOF challenge-import --proof "$WORK/p-other.json" --state "$WORK/si.json" --response "$WORK/ro-other.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='StateConflict'"
+check "import cross-proof state => StateConflict" 0 $?
+# 同 challenge_id 但计数判定不同（手改状态）→ StateConflict
+python3 -c "
+import json
+s=json.load(open('$WORK/sib.json'))
+r=s['history'][0]; r['missing_samples']=0; r['checked_samples']=6
+r['valid']=True; r['failure_reason']='none'
+json.dump(s,open('$WORK/sib-t.json','w'))"
+ERR=$($PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/sib-t.json" --response "$WORK/imp-miss.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='StateConflict'"
+check "import same id differing outcome => StateConflict" 0 $?
+# 历史非法（两种形态混搭/缺键）→ StateConflict
+python3 -c "
+import json
+s=json.load(open('$WORK/si.json'))
+s['history'][0]['requested_samples']=s['history'][0]['samples']
+json.dump(s,open('$WORK/si-t.json','w'))"
+ERR=$($PROOF challenge-import --proof "$WORK/pcov.json" --state "$WORK/si-t.json" --response "$WORK/imp-r.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='StateConflict'"
+check "import malformed history => StateConflict" 0 $?
+$PROOF challenge-import --help >/dev/null 2>&1; check "challenge-import --help exit 0" 0 $?
+
 echo "----------------------------------------"
 echo "PASS=$pass FAIL=$fail"
 [ $fail -eq 0 ]
