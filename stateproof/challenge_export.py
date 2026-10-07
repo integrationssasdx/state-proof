@@ -203,8 +203,13 @@ def _check_evidence_entry(entry, index, fe, chunk_idx, chunk_size):
     return status, digest == chunk["digest"]
 
 
-def run_challenge_verify(proof, response_path):
-    """校验离线挑战凭证，返回判定 dict；任何不合法抛 ResponseFormatError。"""
+def verify_response(proof, response_path):
+    """校验离线挑战凭证，返回判定与样本计数 dict；不合法抛 ResponseFormatError。
+
+    返回的计数字段供 challenge-import 记入状态历史：
+    checked_samples=ok+partial，missing_samples=missing，
+    mismatched_samples=partial 或摘要不符。
+    """
     resp = _load_response(response_path)
 
     if resp.get("version") != VERSION:
@@ -259,6 +264,15 @@ def run_challenge_verify(proof, response_path):
     if challenge_id != expected_id:
         raise ResponseFormatError("响应 challenge_id 与重建结果不一致")
 
+    checked = missing = mismatched = 0
+    for status, match in statuses_match:
+        if status == "missing":
+            missing += 1
+        else:
+            checked += 1
+            if status == "partial" or not match:
+                mismatched += 1
+
     return {
         "proof_id": proof["proof_id"],
         "challenge_id": challenge_id,
@@ -266,5 +280,21 @@ def run_challenge_verify(proof, response_path):
         "samples": samples,
         "valid": rebuilt_valid,
         "failure_reason": rebuilt_reason,
-        "verdict": "valid" if rebuilt_valid else "invalid",
+        "checked_samples": checked,
+        "missing_samples": missing,
+        "mismatched_samples": mismatched,
+    }
+
+
+def run_challenge_verify(proof, response_path):
+    """校验离线挑战凭证，返回判定 dict；任何不合法抛 ResponseFormatError。"""
+    verified = verify_response(proof, response_path)
+    return {
+        "proof_id": verified["proof_id"],
+        "challenge_id": verified["challenge_id"],
+        "seed": verified["seed"],
+        "samples": verified["samples"],
+        "valid": verified["valid"],
+        "failure_reason": verified["failure_reason"],
+        "verdict": "valid" if verified["valid"] else "invalid",
     }

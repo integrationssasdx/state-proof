@@ -498,6 +498,109 @@ ERR=$($PROOF challenge-verify --proof "$WORK/p.json" --response "$WORK/t6.json" 
 [ $? -eq 2 ] && echo "$ERR" | grep -q ChallengeRangeError
 check "verify overrange samples => ChallengeRangeError" 0 $?
 
+# ---------- challenge-import：可验证响应记入状态历史 ----------
+# 导出与当前证明一致的响应（全命中 / 缺失）
+$PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed imp-1 --samples 4 --output "$WORK/imp-ok.json" >/dev/null
+rm "$ROOT/a.txt"
+$PROOF challenge-export --proof "$WORK/p.json" --root "$ROOT" --seed imp-2 --samples 8 --output "$WORK/imp-miss.json" >/dev/null
+printf 'hello world\n' > "$ROOT/a.txt"
+
+# 首次导入：imported=true，计数与证据一致，状态历史追加一条
+OUT=$($PROOF challenge-import --proof "$WORK/p.json" --state "$WORK/simp.json" --response "$WORK/imp-ok.json")
+EC=$?
+check "import exit 0" 0 "$EC"
+echo "$OUT" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['imported'] is True and r['valid'] is True and r['failure_reason']=='none', r
+assert r['samples']==4 and r['checked_samples']==4, r
+assert r['missing_samples']==0 and r['mismatched_samples']==0, r
+assert len(r['challenge_id'])==64 and r['seed']=='imp-1' and r['proof_id'], r"
+check "import valid payload" 0 $?
+python3 -c "
+import json
+s=json.load(open('$WORK/simp.json'))
+assert s['total_challenges']==1 and len(s['history'])==1, s
+h=s['history'][0]
+assert h['seed']=='imp-1' and h['requested_samples']==4 and h['checked_samples']==4, h
+assert h['missing_samples']==0 and h['mismatched_samples']==0 and h['valid'] is True, h
+assert h['failure_reason']=='none' and h['challenged_at'], h"
+check "import state record" 0 $?
+
+# 幂等复导：imported=false，state 不变
+SNAP=$(md5sum "$WORK/simp.json" | cut -d' ' -f1)
+$PROOF challenge-import --proof "$WORK/p.json" --state "$WORK/simp.json" --response "$WORK/imp-ok.json" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['imported'] is False and r['valid'] is True, r"
+check "re-import idempotent" 0 $?
+check "re-import leaves state unchanged" "$SNAP" "$(md5sum "$WORK/simp.json" | cut -d' ' -f1)"
+
+# 缺失响应导入：missing=1、checked=7，判定 retrieval_missing
+$PROOF challenge-import --proof "$WORK/p.json" --state "$WORK/simp.json" --response "$WORK/imp-miss.json" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['imported'] is True and r['valid'] is False and r['failure_reason']=='retrieval_missing', r
+assert r['samples']==8 and r['missing_samples']==1 and r['checked_samples']==7 and r['mismatched_samples']==0, r"
+check "import missing counts" 0 $?
+# 历史顺序保留、聚合计数累加
+python3 -c "
+import json
+s=json.load(open('$WORK/simp.json'))
+assert [h['seed'] for h in s['history']]==['imp-1','imp-2'], s['history']
+assert s['total_challenges']==2 and s['checked_samples']==11 and s['missing_samples']==1, s"
+check "import history order and aggregation" 0 $?
+
+# 覆盖报告纳入导入的历史
+$PROOF coverage-report --proof "$WORK/p.json" --state "$WORK/simp.json" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['covered_chunks']>0 and r['failure_reason']=='challenge_failure' and r['valid'] is False, r
+assert r['failure_streak']==1 and len(r['failed_challenges'])==1, r"
+check "coverage includes imported history" 0 $?
+
+# 同一 challenge_id 计数被改 => StateConflict
+python3 -c "
+import json
+s=json.load(open('$WORK/simp.json'))
+h=s['history'][1]
+h['checked_samples']=6; h['missing_samples']=2
+json.dump(s,open('$WORK/simp-conflict.json','w'))"
+ERR=$($PROOF challenge-import --proof "$WORK/p.json" --state "$WORK/simp-conflict.json" --response "$WORK/imp-miss.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q StateConflict
+check "import conflicting challenge_id => StateConflict" 0 $?
+
+# 错误路径
+$PROOF challenge-import --proof "$WORK/p.json" --state "$WORK/x.json" 2>/dev/null
+check "import missing flags => exit 2" 2 $?
+ERR=$($PROOF challenge-import --proof " " --state "$WORK/x.json" --response "$WORK/imp-ok.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='InputError'"
+check "import blank proof => InputError" 0 $?
+ERR=$($PROOF challenge-import --proof "$WORK/no-p.json" --state "$WORK/x.json" --response "$WORK/imp-ok.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ProofFormatError'"
+check "import missing proof => ProofFormatError" 0 $?
+ERR=$($PROOF challenge-import --proof "$WORK/p.json" --state "$WORK/x.json" --response "$WORK/no-r.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ResponseFormatError'"
+check "import missing response => ResponseFormatError" 0 $?
+ERR=$($PROOF challenge-import --proof "$WORK/p.json" --state "$WORK/x.json" --response "$WORK/t6.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='ChallengeRangeError'"
+check "import overrange samples => ChallengeRangeError" 0 $?
+ERR=$($PROOF challenge-import --proof "$WORK/p.json" --state "$WORK/x.json" --response "$WORK/t1.json" 2>&1)
+[ $? -eq 2 ] && echo "$ERR" | grep -q ResponseFormatError
+check "import tampered response => ResponseFormatError" 0 $?
+echo '???' > "$WORK/badimp.json"
+ERR=$($PROOF challenge-import --proof "$WORK/p.json" --state "$WORK/badimp.json" --response "$WORK/imp-ok.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='StateConflict'"
+check "import corrupt state => StateConflict" 0 $?
+ERR=$($PROOF challenge-import --proof "$WORK/p.json" --state "$WORK/s.json" --response "$WORK/imp-ok.json" 2>&1)
+echo "$ERR" | python3 -c "import json,sys;assert json.load(sys.stdin)['error']['type']=='StateConflict'"
+check "import cross-proof state => StateConflict" 0 $?
+# proof 与 response 只读：导入前后内容不变
+P_SNAP=$(md5sum "$WORK/p.json" "$WORK/imp-ok.json")
+$PROOF challenge-import --proof "$WORK/p.json" --state "$WORK/simp2.json" --response "$WORK/imp-ok.json" >/dev/null
+check "import keeps proof/response read-only" "$P_SNAP" "$(md5sum "$WORK/p.json" "$WORK/imp-ok.json")"
+$PROOF challenge-import --help >/dev/null 2>&1; check "challenge-import --help exit 0" 0 $?
+
 # ---------- proof-diff：证明版本对账 ----------
 mkdir -p "$WORK/v1/sub"
 : > "$WORK/v1/empty.bin"
